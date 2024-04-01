@@ -1,0 +1,8 @@
+- Test.originate : allows to deploy a contract in the testing environment.
+ It takes a contract, which is represented as a function of type 'parameter -> 'storage -> operation list * 'storage,
+  an initial storage of type 'storage, and an initial balance for the contract being deployed. 
+  This function deploys the contract, and returns a record value holding: 
+    michelson_contract, and the size of the program of type int. ('parameter, 'storage) typed_address, the compiled program in Michelson of type ('parameter, 'storage)
+
+- The storage of a deployed contract can be queried using the Test.get_storage function, that given a typed address ('parameter, 'storage) typed_address, returns the 'storage value.
+
