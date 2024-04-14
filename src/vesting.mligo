@@ -1,78 +1,115 @@
-#import "ligo-extendable-fa2/lib/multi_asset/fa2.mligo" "FA2"
-#import "./storage.mligo" "Storage"
-#import "./extension.mligo" "Extension"
+#import "@ligo/fa/lib/main.mligo" "FA2"
 #import "./errors.mligo" "Errors"
-#import "./token_total_supply.mligo" "TokenTotalSupply"
 
-type vesting_schedule = {
+module FA2Module = FA2.SingleAssetExtendable
+
+type vesting_details = {   
   start_time : timestamp;
   end_time : timestamp;
-  total_amount : nat;
+  total_tokens : int;
+  claimed_tokens : nat;
 }
 
-type token_total_supply = TokenTotalSupply.t
-type gen_storage = Storage.t
-type storage = token_total_supply gen_storage
-type result = operation list * storage
-type gen_extension = Extension.t
-type extension = token_total_supply gen_extension
 
-type contract_storage = {
+type extension = {
   admin : address;
-  fa2_address : address;
-  vesting_schedules : (address, vesting_schedule) map;
-  claimed : (address, nat) map;
-  vesting_started : bool;
+  token_id : nat; 
+  beneficiaries : (address, vesting_details) big_map; 
+  beneficiary_list : address list; 
+  freeze_duration : int;
+  free_duration_timestamp : timestamp;
+  vesting_started : bool; 
+  start_time : timestamp; 
 }
 
-type action =
-  | StartVesting of timestamp * timestamp * nat
-  | Claim
+type storage = extension FA2Module.storage
 
-let no_operation : operation list = []
-
-let not_admin = "Not admin"
-let vesting_already_started = "Vesting already started"
-let not_yet_claimable = "Not yet claimable"
-let no_vesting_schedule = "No vesting schedule for this address"
-let all_claimed = "All funds already claimed"
+type ret = operation list * storage
+let no_op : operation list = [] 
 
 [@entry]
-let start_vesting (params : address * timestamp * timestamp * nat) (s : contract_storage) : operation list * contract_storage =
-  let (beneficiary, start_time, end_time, total_amount) = params in (* Extrait les paramètres de la fonction. *)
-  if Tezos.get_sender() <> s.admin then failwith(not_admin) (* Vérifie si l'appelant est l'administrateur. *)
-  else if Map.mem beneficiary s.vesting_schedules then failwith(vesting_already_started) (* Vérifie si le bénéficiaire a déjà un calendrier de vesting. *)
-  else if start_time >= end_time then failwith("Invalid vesting schedule") (* Vérifie si le calendrier de vesting est valide. *)
-  else
-    // let schedule = {start_time; end_time; total_amount} in (* Crée un nouveau calendrier de vesting. *)
-    // let updated_schedules = Map.add beneficiary schedule s.vesting_schedules in (* Ajoute le calendrier au stockage. *)
-    // no_operation, {s with vesting_schedules = updated_schedules} (* Retourne aucune opération et le stockage mis à jour. *)
-    (* Logique pour transférer les tokens du FA2 ici *)
-    let transfer_params = { from_ = Tezos.get_sender(); txs = [ { to_ = s.fa2_address; token_id = 0n; amount = total_amount } ] } in
-    let transfer_op = FA2.transfer transfer_params in
-
-
-    
-    let schedule = {start_time; end_time; total_amount} in (* Crée un nouveau calendrier de vesting. *)
-    let updated_schedules = Map.add beneficiary schedule s.vesting_schedules in (* Ajoute le calendrier au stockage. *)
-    transfer_op, {s with vesting_schedules = updated_schedules} (* Retourne l'opération de transfert et le stockage mis à jour. *)
+let start_vesting (start_params : int) (storage : storage) : ret =
+  let (freeze_duration) = start_params in
+  if Tezos.get_sender() <> storage.extension.admin then failwith(Errors.not_admin)
+  else if storage.extension.vesting_started then failwith(Errors.vesting_already_started)
+  else 
+    let day : int = 86400 * freeze_duration in
+    let now : timestamp = Tezos.get_now() in
+    let schedule : timestamp = now + day in
+    let update_storage = { storage.extension with vesting_started = true; free_duration_timestamp = schedule; start_time = now } in
+    no_op, { storage with extension = update_storage }
 
 [@entry]
-let claim (beneficiary : address) (s : contract_storage) : operation list * contract_storage =
-  match Map.find_opt beneficiary s.vesting_schedules with 
-  | None -> failwith(no_vesting_schedule)
-  | Some schedule ->
+let claim_tokens () (storage : storage) : ret =
+  let beneficiary_address = Tezos.get_sender() in
+  match Big_map.find_opt beneficiary_address storage.extension.beneficiaries with
+  | None -> failwith("You are not a beneficiary")
+  | Some(details) ->
     let now = Tezos.get_now() in
-    if now < schedule.start_time then failwith(not_yet_claimable)
+    if now < storage.extension.free_duration_timestamp then
+      failwith("You can't claim tokens before the freeze duration ends")
     else
-      let claimed_so_far = match Map.find_opt beneficiary s.claimed with | None -> 0n | Some amount -> amount in (* Get the amount already claimed by the beneficiary. *)
-      let total_vesting_time = schedule.end_time - schedule.start_time in
-      let time_elapsed = now - schedule.start_time in
-      let claimable_amount_int = (time_elapsed * schedule.total_amount) / total_vesting_time in
-      (** claimed fo far is a nat**)
-      let amount_to_claim = claimable_amount_int - claimed_so_far in
-      if amount_to_claim = 0 then failwith(all_claimed)
+      let total_vesting_time : int = details.end_time - details.start_time in
+      let elapsed_time : int = now - details.start_time in
+      let claimable_tokens = 
+        if now >= details.end_time then details.total_tokens
+        else (details.total_tokens * elapsed_time) / total_vesting_time in
+      let to_claim = claimable_tokens - details.claimed_tokens in
+      if to_claim > 0 then
+        let transfer_param = [{ from_ = storage.extension.admin; txs = [{ to_ = beneficiary_address; token_id = storage.extension.token_id; amount = abs to_claim}]}] in
+        let (transfer_operations, updated_storage) = FA2Module.transfer transfer_param storage in
+        let updated_details = { details with claimed_tokens = abs claimable_tokens } in
+        let updated_beneficiaries = Big_map.update beneficiary_address (Some updated_details) storage.extension.beneficiaries in
+        (transfer_operations, { updated_storage with extension = { storage.extension with beneficiaries = updated_beneficiaries } })
+      else (no_op, storage)
+
+[@entry]
+let update_beneficiary (update_params : (address * int * int)) (storage : storage) : ret =
+  let (beneficiary, total_tokens, duration) = update_params in
+  if Tezos.get_sender() <> storage.extension.admin then
+    failwith(Errors.not_admin)
+  else if storage.extension.vesting_started then
+    failwith("Vesting has already started, cannot update beneficiary")
+  else
+    let now = Tezos.get_now() in
+    let end_time = now + (86400 * duration) in
+    let new_details = { start_time = now; end_time = end_time; total_tokens = total_tokens; claimed_tokens = abs 0 } in
+    let updated_beneficiaries = Big_map.update beneficiary (Some new_details) storage.extension.beneficiaries in
+    no_op, { storage with extension = { storage.extension with beneficiaries = updated_beneficiaries } }
+
+
+let calculate_claimable_tokens (details : vesting_details) (now : timestamp) (storage : storage) : nat =
+  if now >= details.end_time then
+    abs details.total_tokens  
+  else if now >= storage.extension.free_duration_timestamp then
+    let elapsed_time = now - details.start_time in
+    let total_vesting_time = details.end_time - details.start_time in
+    let tokens = (details.total_tokens * elapsed_time) / total_vesting_time in
+    abs tokens
+  else
+    0n
+
+[@entry]
+let kill()(storage : storage) : ret =
+  let beneficiary_address = Tezos.get_sender() in
+  match Big_map.find_opt beneficiary_address storage.extension.beneficiaries with
+    | None -> failwith("You are not a beneficiary")
+    | Some(details) ->
+      let now = Tezos.get_now() in
+      let claimable_tokens =
+        if now >= details.end_time then
+          details.total_tokens  
+        else if now >= storage.extension.free_duration_timestamp then
+          let elapsed_time = now - details.start_time in
+          let total_vesting_time = details.end_time - details.start_time in
+          (details.total_tokens * elapsed_time) / total_vesting_time 
+        else 0 in
+      let to_claim = claimable_tokens - details.claimed_tokens in
+      if to_claim > 0 then
+        let  _transfer_operations = [{ from_ = storage.extension.admin; txs = [{ to_ = beneficiary_address; token_id = storage.extension.token_id; amount = abs to_claim}]}] in
+        let updated_details = { details with claimed_tokens = abs claimable_tokens } in
+        let _updated_beneficiaries = Big_map.update beneficiary_address (Some updated_details) storage.extension.beneficiaries in
+        (no_op, storage)
       else
-        let transformIntToNat : nat = abs(amount_to_claim) in (** transform int to nat **)
-        let updated_claimed = Map.add beneficiary transformIntToNat s.claimed in
-        no_operation, { s with claimed = updated_claimed }
+        (no_op, storage)
+

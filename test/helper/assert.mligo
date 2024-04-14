@@ -13,3 +13,4 @@ let tx_success (res: test_exec_result) : unit =
             let () = Test.log(error) in
             Test.failwith "Transaction should not fail"
         | Fail _ -> Test.failwith "Transaction should not fail"
+

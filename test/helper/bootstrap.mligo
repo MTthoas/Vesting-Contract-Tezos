@@ -9,4 +9,3 @@ let boot_accounts () : (address * address * address * address * address * addres
     let owner7 = Test.nth_bootstrap_account 7 in
     let resultat = (owner1, owner2, owner3, owner4, owner5, owner6, owner7) in
     resultat
-
